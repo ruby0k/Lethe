@@ -1,0 +1,21 @@
+[project]
+name = "lethe"
+version = "0.1.0"
+description = "Minimal TinyStories VQ compression experiment"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4,<5",
+    "numpy>=2,<3",
+    "tokenizers>=0.22,<1",
+    "torch==2.12.1+cu130"
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
