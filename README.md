@@ -138,3 +138,9 @@ Continuing the frozen-code v3 decoder and latent generator from one to two passe
 ## 40M latent-generator experiment
 
 `train-lm latent40` trains a 38.99M-parameter generator on the unchanged v3 code stream. One pass reached 5.7084 validation loss versus 5.7481 for the one-pass 10M model, but took 1,279.5s and retained the same repetition and entity confusion. The BPE baseline was preferable in about four of five fixed-prompt pairs. Larger generator capacity is not the missing piece; see `results/v3-latent40/assessment.md`.
+
+## Final verdict
+
+This MVP did **not** meet its success criterion. Plain v3 provides 4x shorter sequences and made the original 10M latent-generator run 3.67x faster than the BPE baseline, but its generated stories are not comparable in quality. The codec discards names, rare details, and relations; longer decoder training improved greedy reconstruction only from 55.64% to 56.93%, while longer or 40M generator training did not materially improve samples. Correction streams preserve more information but reduce compression and are difficult to generate reliably.
+
+The useful result is negative: compressed-sequence training can be faster, but this fixed VQ representation trades away too much information and predictability. Further scaling of this design is stopped.
