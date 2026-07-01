@@ -144,3 +144,21 @@ Continuing the frozen-code v3 decoder and latent generator from one to two passe
 This MVP did **not** meet its success criterion. Plain v3 provides 4x shorter sequences and made the original 10M latent-generator run 3.67x faster than the BPE baseline, but its generated stories are not comparable in quality. The codec discards names, rare details, and relations; longer decoder training improved greedy reconstruction only from 55.64% to 56.93%, while longer or 40M generator training did not materially improve samples. Correction streams preserve more information but reduce compression and are difficult to generate reliably.
 
 The useful result is negative: compressed-sequence training can be faster, but this fixed VQ representation trades away too much information and predictability. Further scaling of this design is stopped.
+
+## Optional LM Studio post-repair
+
+The normal `report` command can send each decoded v3 continuation to a local OpenAI-compatible LM Studio model:
+
+```powershell
+uv run python lethe.py report --repair-model liquid/lfm2.5-1.2b --out-dir results/v3-lfm-repair
+```
+
+LFM2.5 improved grammar and repetition in four of five fixed samples at 1.75s repair latency, but could not restore missing facts or resolve entity confusion. Decode plus repair averaged 32.38s versus 21.29s for baseline generation while both models shared the GPU. This remains optional surface cleanup, not a successful fix; see `results/v3-lfm-repair/assessment.md`.
+
+## Near-lossless residual experiment
+
+`near-lossless-diagnostic` adds the minimum exact residual corrections needed to reach specified reconstruction targets. On the controlled 1,600 blocks, 95.31% reconstruction required 24.57 corrections per block. Although those values can be packed to 1.31x storage compression, the practical factorized Transformer stream is 65.13 tokens per 64-token BPE block, or 0.98x compression. Full losslessness expands to 71.13 tokens. Because the near-lossless stream is already longer than BPE and much harder to predict, generator training was skipped. See `results/v3-near-lossless/assessment.md`.
+
+## Dual-codec experiment
+
+`dual-codec-diagnostic` combines plain v3 with the v3.2 rarity-priority codec, reducing compression to 2x. On the controlled 1,600 blocks, an oracle merger reached 64.95% overall but only 7.07% rare accuracy. A practical confidence merger reached 58.30% overall and 3.91% rare accuracy. This is dominated by v3.3 corrections at 60.27% overall, 61.30% rare, and 3.20x compression, so paired generators were not trained. See `results/v3-dual-codec/assessment.md`.

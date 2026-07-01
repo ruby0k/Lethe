@@ -8,6 +8,8 @@ import math
 import random
 import re
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
@@ -1489,6 +1491,162 @@ def rare_diagnostic(args) -> None:
 
 
 @torch.no_grad()
+def near_lossless_diagnostic(args) -> None:
+    if not args.targets or any(not 0 < target <= 1 for target in args.targets):
+        raise ValueError("--targets must contain values in (0, 1]")
+    device = device_from(args.device)
+    model, _ = load_ae(Path(args.autoencoder), device)
+    raw = load_tokens(Path(args.data_dir) / "val.bin")
+    latent = load_tokens(Path(args.latent_dir) / "val.bin")
+    wrong_counts = []
+    for first in range(1, args.blocks + 1, args.batch_size):
+        count = min(args.batch_size, args.blocks - first + 1)
+        indices = np.arange(first, first + count)
+        offsets, code_offsets = np.arange(RAW_BLOCK), np.arange(CODES_PER_BLOCK)
+        history = torch.from_numpy(
+            raw[(indices[:, None] - 1) * RAW_BLOCK + offsets].astype(np.int64)
+        ).to(device)
+        targets = torch.from_numpy(
+            raw[indices[:, None] * RAW_BLOCK + offsets].astype(np.int64)
+        ).to(device)
+        codes = torch.from_numpy(
+            latent[indices[:, None] * CODES_PER_BLOCK + code_offsets].astype(np.int64)
+        ).to(device)
+        wrong_counts.extend((model.reconstruct(codes, history) != targets).sum(1).cpu().tolist())
+
+    wrong = np.asarray(wrong_counts)
+    rows = []
+    for target in args.targets:
+        target_correct = math.ceil(target * RAW_BLOCK)
+        corrections = np.maximum(0, target_correct - (RAW_BLOCK - wrong))
+        achieved = np.minimum(RAW_BLOCK, RAW_BLOCK - wrong + corrections).mean() / RAW_BLOCK
+        mean_corrections = float(corrections.mean())
+        packed_bits = CODES_PER_BLOCK * 10 + 6 + 19 * mean_corrections
+        transformer_tokens = CODES_PER_BLOCK + 2 * mean_corrections
+        rows.append(
+            {
+                "target_accuracy": target,
+                "achieved_accuracy": achieved,
+                "corrections_per_block": mean_corrections,
+                "packed_bit_compression_vs_13bit_bpe": RAW_BLOCK * 13 / packed_bits,
+                "transformer_sequence_compression_vs_bpe": RAW_BLOCK / transformer_tokens,
+            }
+        )
+    result = {
+        "blocks": args.blocks,
+        "base_accuracy": 1 - float(wrong.mean()) / RAW_BLOCK,
+        "format": "16 ten-bit v3 codes + 6-bit count + N exact 19-bit (position, BPE token) residuals",
+        "rows": rows,
+    }
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print(json.dumps(result, indent=2))
+
+
+@torch.no_grad()
+def reconstruct_with_confidence(
+    model: VQAutoencoder, codes: torch.Tensor, history: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    generated, confidences = [], []
+    for _ in range(RAW_BLOCK):
+        prefix = (
+            torch.cat(generated, dim=1)
+            if generated
+            else torch.empty((len(codes), 0), dtype=torch.long, device=codes.device)
+        )
+        probe = torch.cat(
+            (prefix, torch.zeros((len(codes), 1), dtype=torch.long, device=codes.device)), dim=1
+        )
+        logits = model.decoder_logits(codes, history, probe, 0.0)[:, -1].float()
+        confidence, token = F.log_softmax(logits, -1).max(-1, keepdim=True)
+        generated.append(token)
+        confidences.append(confidence)
+    return torch.cat(generated, dim=1), torch.cat(confidences, dim=1)
+
+
+@torch.no_grad()
+def dual_codec_diagnostic(args) -> None:
+    device = device_from(args.device)
+    base, _ = load_ae(Path(args.base_autoencoder), device)
+    priority, _ = load_ae(Path(args.priority_autoencoder), device)
+    raw_dir = Path(args.data_dir)
+    raw, train = load_tokens(raw_dir / "val.bin"), load_tokens(raw_dir / "train.bin")
+    base_latent = load_tokens(Path(args.base_latent_dir) / "val.bin")
+    priority_latent = load_tokens(Path(args.priority_latent_dir) / "val.bin")
+    frequencies = torch.from_numpy(
+        np.bincount(train, minlength=base.config.vocab_size).astype(np.int64)
+    ).to(device)
+    totals = Counter()
+    for first in range(1, args.blocks + 1, args.batch_size):
+        count = min(args.batch_size, args.blocks - first + 1)
+        indices = np.arange(first, first + count)
+        offsets, code_offsets = np.arange(RAW_BLOCK), np.arange(CODES_PER_BLOCK)
+        history = torch.from_numpy(
+            raw[(indices[:, None] - 1) * RAW_BLOCK + offsets].astype(np.int64)
+        ).to(device)
+        targets = torch.from_numpy(
+            raw[indices[:, None] * RAW_BLOCK + offsets].astype(np.int64)
+        ).to(device)
+        base_codes = torch.from_numpy(
+            base_latent[indices[:, None] * CODES_PER_BLOCK + code_offsets].astype(np.int64)
+        ).to(device)
+        priority_codes = torch.from_numpy(
+            priority_latent[indices[:, None] * CODES_PER_BLOCK + code_offsets].astype(np.int64)
+        ).to(device)
+        with amp_context(device):
+            base_tokens, base_confidence = reconstruct_with_confidence(base, base_codes, history)
+            priority_tokens, priority_confidence = reconstruct_with_confidence(
+                priority, priority_codes, history
+            )
+        base_correct, priority_correct = base_tokens == targets, priority_tokens == targets
+        rare = frequencies[targets] <= args.rare_cutoff
+        confidence_tokens = torch.where(
+            priority_confidence > base_confidence, priority_tokens, base_tokens
+        )
+        rare_gate = (frequencies[priority_tokens] <= args.rare_cutoff) & (
+            priority_confidence > base_confidence
+        )
+        rare_confidence_tokens = torch.where(rare_gate, priority_tokens, base_tokens)
+        for name, matches in (
+            ("base", base_correct),
+            ("priority", priority_correct),
+            ("oracle_union", base_correct | priority_correct),
+            ("confidence_merge", confidence_tokens == targets),
+            ("rare_confidence_merge", rare_confidence_tokens == targets),
+        ):
+            totals[f"{name}_correct"] += int(matches.sum())
+            totals[f"{name}_rare_correct"] += int((matches & rare).sum())
+        totals["agree"] += int((base_tokens == priority_tokens).sum())
+        totals["both_correct"] += int((base_correct & priority_correct).sum())
+        totals["tokens"] += targets.numel()
+        totals["rare_tokens"] += int(rare.sum())
+
+    def metrics(name: str) -> dict:
+        return {
+            "accuracy": totals[f"{name}_correct"] / totals["tokens"],
+            "rare_accuracy": totals[f"{name}_rare_correct"] / max(1, totals["rare_tokens"]),
+        }
+
+    result = {
+        "blocks": args.blocks,
+        "compression_if_both_streams": 2.0,
+        "agreement": totals["agree"] / totals["tokens"],
+        "both_correct": totals["both_correct"] / totals["tokens"],
+        **{
+            name: metrics(name)
+            for name in (
+                "base", "priority", "oracle_union", "confidence_merge", "rare_confidence_merge"
+            )
+        },
+    }
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print(json.dumps(result, indent=2))
+
+
+@torch.no_grad()
 def correction_diagnostic(args) -> None:
     device = device_from(args.device)
     model, _ = load_ae(Path(args.autoencoder), device)
@@ -2714,6 +2872,46 @@ def accounting_checkpoint(path: Path, device: str) -> dict:
     return torch.load(latest if latest.exists() else path, map_location=device, weights_only=False)
 
 
+def repair_with_lmstudio(text: str, url: str, model: str, timeout: float) -> str:
+    repaired = ""
+    for attempt in range(2):
+        instruction = (
+            "You conservatively repair malformed generated children's story text. Rewrite every "
+            "sentence and paragraph; do not summarize, truncate, or omit content. Preserve names, "
+            "events, objects, order, and length. Fix grammar, broken fragments, accidental repetition, "
+            "and direct contradictions. Do not invent a different story, add commentary, or explain "
+            "changes. Return only the complete repaired text."
+        )
+        if attempt:
+            instruction += " Your previous answer was too short; the answer must be at least 70% as long as the input."
+        payload = json.dumps(
+            {
+                "model": model,
+                "temperature": 0.2,
+                "max_tokens": 700,
+                "messages": [
+                    {"role": "system", "content": instruction},
+                    {"role": "user", "content": text},
+                ],
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            url.rstrip("/") + "/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                result = json.load(response)
+            repaired = result["choices"][0]["message"]["content"].strip()
+        except (urllib.error.URLError, TimeoutError, KeyError, IndexError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"LM Studio repair failed: {error}") from error
+        if len(repaired) >= 0.7 * len(text):
+            return repaired
+    return text
+
+
 @torch.no_grad()
 def report(args) -> None:
     device = device_from(args.device)
@@ -2779,7 +2977,7 @@ def report(args) -> None:
         ae.reconstruct(warm_codes, warm_raw if ae.config.decoder_context else None)
     synchronize(device)
 
-    pairs, timings = [], {"baseline": [], "latent": []}
+    pairs, timings = [], {"baseline": [], "latent": [], "repair": []}
     for sample_index in range(args.samples):
         block_index = sample_index * 17
         raw_start, code_start = block_index * RAW_BLOCK, block_index * CODES_PER_BLOCK
@@ -2814,7 +3012,14 @@ def report(args) -> None:
         latent_text = tokenizer.decode(decoded_ids.cpu().tolist(), skip_special_tokens=True)
         synchronize(device)
         timings["latent"].append(time.perf_counter() - started)
-        pairs.append({"prompt": prompt, "baseline": baseline_text, "latent": latent_text})
+        pair = {"prompt": prompt, "baseline": baseline_text, "latent": latent_text}
+        if args.repair_model:
+            started = time.perf_counter()
+            pair["repaired"] = repair_with_lmstudio(
+                latent_text, args.repair_url, args.repair_model, args.repair_timeout
+            )
+            timings["repair"].append(time.perf_counter() - started)
+        pairs.append(pair)
 
     rng = random.Random(1337)
     blind_text = [
@@ -2825,19 +3030,18 @@ def report(args) -> None:
     ]
     key = {}
     for index, pair in enumerate(pairs, 1):
-        swapped = bool(rng.getrandbits(1))
-        a_name, b_name = (("latent", "baseline") if swapped else ("baseline", "latent"))
-        key[str(index)] = {"A": a_name, "B": b_name}
+        names = ["baseline", "latent"] + (["repaired"] if args.repair_model else [])
+        rng.shuffle(names)
+        labels = [chr(ord("A") + position) for position in range(len(names))]
+        key[str(index)] = dict(zip(labels, names))
         blind_text += [
             f"## Pair {index}",
             "",
             f"Prompt: {pair['prompt']}",
             "",
-            f"A: {pair[a_name]}",
-            "",
-            f"B: {pair[b_name]}",
-            "",
         ]
+        for label, name in zip(labels, names):
+            blind_text += [f"{label}: {pair[name]}", ""]
     (out / "samples_blind.md").write_text("\n".join(blind_text), encoding="utf-8")
     (out / "sample_key.json").write_text(json.dumps(key, indent=2), encoding="utf-8")
 
@@ -2853,6 +3057,9 @@ def report(args) -> None:
     )
     baseline_latency = sum(timings["baseline"]) / len(timings["baseline"])
     latent_latency = sum(timings["latent"]) / len(timings["latent"])
+    repair_latency = (
+        sum(timings["repair"]) / len(timings["repair"]) if timings["repair"] else None
+    )
     raw_count = latent_meta["train"]["raw_tokens"]
     code_count = latent_meta["train"]["codes"]
     metrics = {
@@ -2879,9 +3086,13 @@ def report(args) -> None:
             "baseline_mean": baseline_latency,
             "latent_mean_including_decode": latent_latency,
             "speedup": baseline_latency / latent_latency,
+            "repair_mean": repair_latency,
+            "latent_decode_plus_repair_mean": (
+                latent_latency + repair_latency if repair_latency is not None else None
+            ),
         },
         "sample_quality": {
-            "method": "blinded human A/B, 1-5 coherence and story quality",
+            "method": "blinded human comparison, 1-5 coherence and story quality",
             "status": "pending rating",
             "samples": str(out / "samples_blind.md"),
             "key": str(out / "sample_key.json"),
@@ -2893,6 +3104,11 @@ def report(args) -> None:
         },
     }
     (out / "report.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    repair_markdown = (
+        f"| LFM repair | {repair_latency:.3f}s; decode + repair {latent_latency + repair_latency:.3f}s |\n"
+        if repair_latency is not None
+        else ""
+    )
     markdown = f"""# Lethe MVP results
 
 | Measure | Result |
@@ -2906,7 +3122,7 @@ def report(args) -> None:
 | Baseline LM training | {baseline_seconds:.1f}s |
 | Amortized break-even | {break_even_runs if break_even_runs is not None else 'never'} generator runs |
 | Latent generation + decode | {latent_latency:.3f}s ({baseline_latency / latent_latency:.2f}x vs baseline) |
-| Baseline generation | {baseline_latency:.3f}s |
+{repair_markdown}| Baseline generation | {baseline_latency:.3f}s |
 | Final sample quality | Pending blinded rating in `samples_blind.md` |
 
 Success is pending until the blinded stories are comparable and reusable generator training is materially faster.
@@ -3437,6 +3653,34 @@ def main() -> None:
     command.set_defaults(function=rare_diagnostic)
 
     command = commands.add_parser(
+        "near-lossless-diagnostic", help="sweep exact residuals needed for near-lossless v3"
+    )
+    command.add_argument("--autoencoder", default="checkpoints/autoencoder-v3-context-rope-2pass/best.pt")
+    command.add_argument("--data-dir", default="data/tinystories")
+    command.add_argument("--latent-dir", default="data/latent-v2")
+    command.add_argument("--out", default="results/v3-near-lossless/diagnostic.json")
+    command.add_argument("--blocks", type=int, default=1600)
+    command.add_argument("--batch-size", type=int, default=32)
+    command.add_argument("--targets", type=float, nargs="+", default=(0.80, 0.90, 0.95, 0.99, 1.0))
+    add_device(command)
+    command.set_defaults(function=near_lossless_diagnostic)
+
+    command = commands.add_parser(
+        "dual-codec-diagnostic", help="merge plain and rare-priority v3 decoder outputs"
+    )
+    command.add_argument("--base-autoencoder", default="checkpoints/autoencoder-v3-context-rope/best.pt")
+    command.add_argument("--priority-autoencoder", default="checkpoints/autoencoder-v3.2-priority/best.pt")
+    command.add_argument("--data-dir", default="data/tinystories")
+    command.add_argument("--base-latent-dir", default="data/latent-v2")
+    command.add_argument("--priority-latent-dir", default="data/latent-v3.2-priority")
+    command.add_argument("--out", default="results/v3-dual-codec/diagnostic.json")
+    command.add_argument("--blocks", type=int, default=1600)
+    command.add_argument("--batch-size", type=int, default=32)
+    command.add_argument("--rare-cutoff", type=int, default=1000)
+    add_device(command)
+    command.set_defaults(function=dual_codec_diagnostic)
+
+    command = commands.add_parser(
         "correction-diagnostic", help="test fixed packed corrections for rare and surprising tokens"
     )
     command.add_argument("--autoencoder", default="checkpoints/autoencoder-v3-context-rope/best.pt")
@@ -3598,6 +3842,9 @@ def main() -> None:
     command.add_argument("--new-tokens", type=int, default=256)
     command.add_argument("--eval-batches", type=int, default=50)
     command.add_argument("--eval-batch-size", type=int, default=32)
+    command.add_argument("--repair-url", default="http://127.0.0.1:1234/v1")
+    command.add_argument("--repair-model", default="", help="LM Studio model ID; empty disables repair")
+    command.add_argument("--repair-timeout", type=float, default=120.0)
     add_device(command)
     command.set_defaults(function=report)
 
